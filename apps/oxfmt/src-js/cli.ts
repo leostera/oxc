@@ -14,6 +14,7 @@ import {
   loadVitePlusConfig,
   trackJsConfigDependencies,
 } from "./cli/js_config";
+import { excludeCacheFromTaskRunner } from "./cli/task-runner";
 
 /**
  * What Node read for `--cache`: for the JS/TS configs (`"config"`), or in the workers (`"format"`).
@@ -61,6 +62,7 @@ void (async () => {
   if (args.includes("--cache")) {
     trackJsConfigDependencies();
     trackWorkerReads();
+    excludeCacheFromTaskRunner(args);
   }
 
   // Call the Rust CLI first, to parse args and determine mode
