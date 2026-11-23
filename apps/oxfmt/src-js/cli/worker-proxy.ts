@@ -7,6 +7,9 @@ import type {
   SortTailwindClassesArgs,
 } from "../libs/apis";
 
+import type { Tracked } from "../cli-worker";
+import type { Reads } from "./track-reads";
+
 // Worker pool for parallel Prettier formatting
 let pool: Tinypool | null = null;
 let poolSize: number | null = null;
@@ -45,6 +48,45 @@ async function getPool(): Promise<Tinypool> {
   return pool;
 }
 
+// ---
+
+/**
+ * What the workers read for the calls so far, with `--cache`:
+ * `undefined` until tracking starts, `null` once a worker couldn't record its reads.
+ */
+let reads: { files: Set<string>; dirs: Set<string> } | null | undefined;
+
+/**
+ * Have the workers report what they read for each call, so `--cache` can keep a result that
+ * called into them until one of those files changes. Call before the first call.
+ */
+export function trackWorkerReads(): void {
+  if (reads !== undefined) return;
+  reads = { files: new Set(), dirs: new Set() };
+  // Workers inherit the environment: they record reads from their start.
+  process.env.OXFMT_CACHE_TRACK_READS = "1";
+}
+
+/**
+ * What the workers read so far, or `null` when they can't say.
+ */
+export function workerReads(): Reads | null {
+  return reads ? { files: [...reads.files], dirs: [...reads.dirs] } : null;
+}
+
+async function run<T>(task: object, name: string): Promise<T> {
+  const pool = await getPool();
+  if (reads === undefined) return pool.run(task, { name });
+  const out: Tracked<T> = await pool.run(task, { name });
+  if (out.reads === null) reads = null;
+  else if (reads) {
+    for (const file of out.reads.files) reads.files.add(file);
+    for (const dir of out.reads.dirs) reads.dirs.add(dir);
+  }
+  if (!out.ok) throw out.error;
+  return out.value;
+}
+
 export async function disposeExternalServices(): Promise<void> {
   await pool?.destroy();
   pool = null;
@@ -57,11 +99,7 @@ export function formatFile(
   options: FormatFileParam["options"],
   code: string,
 ): Promise<FormatFileResult> {
-  return toFormatFileResult(
-    getPool().then((pool) =>
-      pool.run({ options, code } satisfies FormatFileParam, { name: "formatFile" }),
-    ),
-  );
+  return toFormatFileResult(run({ options, code } satisfies FormatFileParam, "formatFile"));
 }
 
 // ---
@@ -70,13 +108,7 @@ export function formatEmbeddedDoc(
   options: FormatEmbeddedDocParam["options"],
   code: string,
 ): Promise<string | null> {
-  return toNullable(
-    getPool().then((pool) =>
-      pool.run({ options, code } satisfies FormatEmbeddedDocParam, {
-        name: "formatEmbeddedDoc",
-      }),
-    ),
-  );
+  return toNullable(run({ options, code } satisfies FormatEmbeddedDocParam, "formatEmbeddedDoc"));
 }
 
 export function sortTailwindClasses(
@@ -84,10 +116,6 @@ export function sortTailwindClasses(
   classes: string[],
 ): Promise<string[] | null> {
   return toNullable(
-    getPool().then((pool) =>
-      pool.run({ classes, options } satisfies SortTailwindClassesArgs, {
-        name: "sortTailwindClasses",
-      }),
-    ),
+    run({ classes, options } satisfies SortTailwindClassesArgs, "sortTailwindClasses"),
   );
 }

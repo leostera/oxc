@@ -9,10 +9,14 @@ use cow_utils::CowUtils;
 use rayon::prelude::*;
 use tracing::debug_span;
 
+use oxc_cache::Digest;
 use oxc_diagnostics::{DiagnosticSender, DiagnosticService};
 
-use super::command::OutputMode;
-use crate::core::{FormatPlan, FormatResult, SourceFormatter, utils};
+use super::{
+    cache::{CachedFile, FileCache, Verdict},
+    command::OutputMode,
+};
+use crate::core::{ExternalCalls, FormatPlan, FormatResult, SourceFormatter, utils};
 
 pub enum SuccessResult {
     /// Path with elapsed time, only measured in check mode
@@ -24,6 +28,8 @@ pub struct FormatService {
     cwd: Box<Path>,
     format_mode: OutputMode,
     formatter: SourceFormatter,
+    /// With `--cache`: the verdicts, to skip files known formatted and record the others.
+    cache: Option<Arc<FileCache>>,
 }
 
 impl FormatService {
@@ -31,7 +37,14 @@ impl FormatService {
     where
         T: Into<Box<Path>>,
     {
-        Self { cwd: cwd.into(), format_mode, formatter }
+        Self { cwd: cwd.into(), format_mode, formatter, cache: None }
+    }
+
+    /// Uses `cache`, with `--cache`.
+    #[must_use]
+    pub fn with_cache(mut self, cache: Option<Arc<FileCache>>) -> Self {
+        self.cache = cache;
+        self
     }
 
     /// Process entries as they are received from the channel
@@ -41,10 +54,17 @@ impl FormatService {
         tx_error: &DiagnosticSender,
         tx_success: &mpsc::Sender<SuccessResult>,
     ) {
-        rx_entry.into_iter().par_bridge().for_each(|plan| {
+        // Arrival order is the walk's: kept with each file, so a later run that formats only
+        // some files can report them in the order a full run would.
+        rx_entry.into_iter().enumerate().par_bridge().for_each(|(order, plan)| {
             let start_time = matches!(self.format_mode, OutputMode::Check).then(Instant::now);
 
             let path = Arc::clone(&plan.path);
+            let cached = self.cache.as_ref().and_then(|cache| cache.lookup(&path, &plan, order));
+            if cached.as_ref().is_some_and(CachedFile::formatted_by_stat) {
+                let _ = tx_success.send(SuccessResult::Unchanged);
+                return;
+            }
             let Ok(source_text) = debug_span!("oxfmt::read", path = %path.display())
                 .in_scope(|| utils::read_to_string(&path))
             else {
@@ -66,7 +86,20 @@ impl FormatService {
                 return;
             };
 
-            let (code, is_changed) = match self.formatter.format(&source_text, plan) {
+            let content = cached.as_ref().map(|_| Digest::of_bytes(source_text.as_bytes()));
+            if let (Some(file), Some(content)) = (&cached, content)
+                && file.formatted_by_content(content)
+            {
+                let _ = tx_success.send(SuccessResult::Unchanged);
+                return;
+            }
+
+            let (result, with_node) =
+                ExternalCalls::track(|| self.formatter.format(&source_text, plan));
+            if let (Some(file), Some(content)) = (&cached, content) {
+                file.record(content, Verdict::of(&result, with_node));
+            }
+            let (code, is_changed) = match result {
                 FormatResult::Success { code, is_changed } => (code, is_changed),
                 FormatResult::Error(diagnostics) => {
                     let errors = DiagnosticService::wrap_diagnostics(

@@ -7,7 +7,10 @@ mod overrides;
 mod scopes;
 
 #[cfg(feature = "napi")]
-pub use js_config::{JsConfigLoaderCb, JsLoadJsConfigCb, create_js_config_loader};
+pub use js_config::{
+    JsConfigLoaderCb, JsDependenciesCb, JsDependenciesJsCb, JsDependencyKind, JsLoadJsConfigCb,
+    create_js_config_loader, create_js_dependencies,
+};
 pub use nested::NestedConfigCtx;
 pub use scopes::ConfigScopes;
 

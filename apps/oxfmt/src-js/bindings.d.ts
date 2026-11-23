@@ -72,9 +72,10 @@ export declare function jsTextToDoc(sourceExt: string, sourceText: string, oxfmt
  * 4. `format_file_cb`: Callback to format files
  * 5. `format_embedded_doc_cb`: Callback to format embedded code in templates as a Prettier Doc
  * 6. `sort_tailwindcss_classes_cb`: Callback to sort Tailwind classes
+ * 7. `js_dependencies_cb`: Callback returning what Node read for configs or in the workers (for `--cache`)
  *
  * Returns a tuple of `[mode, exitCode]`:
  * - `mode`: If main logic will run in JS side, use this to indicate which mode
  * - `exitCode`: If main logic already ran in Rust side, return the exit code
  */
-export declare function runCli(args: Array<string>, loadJsConfigCb: (path: string) => Promise<any>, initExternalServicesCb: (numThreads: number) => Promise<void>, formatFileCb: (options: Record<string, any>, code: string) => Promise<{ ok: true; code: string; } | { ok: false; error: string }>, formatEmbeddedDocCb: (options: Record<string, any>, code: string) => Promise<string | null>, sortTailwindcssClassesCb: (options: Record<string, any>, classes: string[]) => Promise<string[] | null>): Promise<[string, number | undefined | null]>
+export declare function runCli(args: Array<string>, loadJsConfigCb: (path: string) => Promise<any>, initExternalServicesCb: (numThreads: number) => Promise<void>, formatFileCb: (options: Record<string, any>, code: string) => Promise<{ ok: true; code: string; } | { ok: false; error: string }>, formatEmbeddedDocCb: (options: Record<string, any>, code: string) => Promise<string | null>, sortTailwindcssClassesCb: (options: Record<string, any>, classes: string[]) => Promise<string[] | null>, jsDependenciesCb: (kind: string) => Promise<{ files: string[]; dirs: string[] } | null>): Promise<[string, number | undefined | null]>

@@ -5,8 +5,25 @@ import {
   formatFile,
   formatEmbeddedDoc,
   sortTailwindClasses,
+  trackWorkerReads,
+  workerReads,
 } from "./cli/worker-proxy";
-import { loadJsConfig, loadVitePlusConfig } from "./cli/js_config";
+import {
+  jsConfigDependencies,
+  loadJsConfig,
+  loadVitePlusConfig,
+  trackJsConfigDependencies,
+} from "./cli/js_config";
+
+/**
+ * What Node read for `--cache`: for the JS/TS configs (`"config"`), or in the workers (`"format"`).
+ * `null` when this Node.js can't say.
+ */
+async function jsDependencies(kind: string): Promise<{ files: string[]; dirs: string[] } | null> {
+  if (kind === "format") return workerReads();
+  const files = await jsConfigDependencies();
+  return files && { files, dirs: [] };
+}
 
 // napi-JS `oxfmt` CLI entry point
 // See also `run_cli()` function in `./src/main_napi.rs`
@@ -39,6 +56,13 @@ void (async () => {
   // and Prettier calls in `worker_threads`, whose stdout is piped through this `process.stdout`.
   if (args.includes("--lsp")) process.stdout.write = process.stderr.write.bind(process.stderr);
 
+  // With `--cache`, a JS/TS config's value, or a result Prettier or the Tailwind sorter had a part in,
+  // is kept until a file Node read for it changes, so record those from the start.
+  if (args.includes("--cache")) {
+    trackJsConfigDependencies();
+    trackWorkerReads();
+  }
+
   // Call the Rust CLI first, to parse args and determine mode
   // NOTE: If the mode is formatter CLI, it will also perform formatting and return an exit code
   const [mode, exitCode] = await runCli(
@@ -48,6 +72,7 @@ void (async () => {
     formatFile,
     formatEmbeddedDoc,
     sortTailwindClasses,
+    jsDependencies,
   );
 
   // Migration modes are handled by JS

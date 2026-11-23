@@ -19,17 +19,21 @@ let vitePlusCache: Promise<typeof import("vite-plus")> | null = null;
  *
  * @param path - Absolute path to the Vite config file
  * @param fieldName - Field name to extract from the resolved config (e.g. `"fmt"`, `"lint"`)
+ * @param onDependencies - Called with the files Vite bundled the config from (`configFileDependencies`)
  * @returns The field as an object, or `null` when the field is missing (signals "skip")
  * @throws When the field exists but is not a plain object
  */
 export async function loadViteConfigField(
   path: string,
   fieldName: "lint" | "fmt",
+  onDependencies?: (files: string[]) => void,
 ): Promise<object | null> {
   vitePlusCache ??= import("vite-plus");
   const { resolveConfigFromFile } = await vitePlusCache;
 
   const config = (await resolveConfigFromFile(path)) as unknown as Record<string, unknown>;
+  const dependencies = config.configFileDependencies;
+  onDependencies?.(Array.isArray(dependencies) ? dependencies.map(String) : []);
 
   // Signal "skip" when the field is missing
   if (!(fieldName in config)) return null;

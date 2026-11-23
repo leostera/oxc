@@ -10,8 +10,9 @@ use crate::{
     api::{format_api, text_to_doc_api},
     cli::{MigrateSource, Mode, StdinRunner, WalkRunner, format_command, init_rayon},
     core::{
-        ExternalServices, JsFormatEmbeddedDocCb, JsFormatFileCb, JsInitExternalServicesCb,
-        JsLoadJsConfigCb, JsSortTailwindClassesCb, create_js_config_loader, utils,
+        ExternalServices, JsDependenciesJsCb, JsFormatEmbeddedDocCb, JsFormatFileCb,
+        JsInitExternalServicesCb, JsLoadJsConfigCb, JsSortTailwindClassesCb,
+        create_js_config_loader, create_js_dependencies, utils,
     },
     lsp::run_lsp,
 };
@@ -26,6 +27,7 @@ use crate::{
 /// 4. `format_file_cb`: Callback to format files
 /// 5. `format_embedded_doc_cb`: Callback to format embedded code in templates as a Prettier Doc
 /// 6. `sort_tailwindcss_classes_cb`: Callback to sort Tailwind classes
+/// 7. `js_dependencies_cb`: Callback returning what Node read for configs or in the workers (for `--cache`)
 ///
 /// Returns a tuple of `[mode, exitCode]`:
 /// - `mode`: If main logic will run in JS side, use this to indicate which mode
@@ -48,6 +50,8 @@ pub async fn run_cli(
         ts_arg_type = "(options: Record<string, any>, classes: string[]) => Promise<string[] | null>"
     )]
     sort_tailwindcss_classes_cb: JsSortTailwindClassesCb,
+    #[napi(ts_arg_type = "(kind: string) => Promise<{ files: string[]; dirs: string[] } | null>")]
+    js_dependencies_cb: JsDependenciesJsCb,
 ) -> (String, Option<u8>) {
     // Convert `String` args to `OsString` for compatibility with `bpaf`
     let args: Vec<OsString> = args.into_iter().map(OsString::from).collect();
@@ -110,6 +114,7 @@ pub async fn run_cli(
                 WalkRunner::new(command)
                     .with_external_services(Some(external_services.clone()))
                     .with_js_config_loader(Arc::clone(&js_config_loader))
+                    .with_js_dependencies(create_js_dependencies(js_dependencies_cb))
                     .run()
             });
 

@@ -54,3 +54,49 @@ pub fn create_js_config_loader(cb: JsLoadJsConfigCb) -> JsConfigLoaderCb {
         res.map_err(|e| e.reason)
     })
 }
+
+/// What Node read, for `--cache`: for JS/TS configs (`"config"`) or in the format workers (`"format"`).
+/// Resolves to `{ files: string[], dirs: string[] }`, or `null` when the runtime can't report it.
+pub type JsDependenciesJsCb =
+    ThreadsafeFunction<String, Promise<Option<Value>>, String, Status, false>;
+
+/// Files and directories Node read (directories: listed), as absolute paths.
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct JsDependencies {
+    /// Files read, or looked for and missing.
+    pub files: Vec<String>,
+    /// Directories listed.
+    pub dirs: Vec<String>,
+}
+
+/// Which reads to ask Node for.
+#[derive(Debug, Clone, Copy)]
+pub enum JsDependencyKind {
+    /// Loading JS/TS configs.
+    Config,
+    /// Formatting in the workers: Prettier, its plugins, the Tailwind sorter.
+    Format,
+}
+
+/// What Node read, `None` when it can't be known.
+pub type JsDependenciesCb = Arc<dyn Fn(JsDependencyKind) -> Option<JsDependencies> + Send + Sync>;
+
+/// Wrap the NAPI callback as a blocking function, as [`create_js_config_loader`] does.
+pub fn create_js_dependencies(cb: JsDependenciesJsCb) -> JsDependenciesCb {
+    let handle = tokio::runtime::Handle::current();
+    Arc::new(move |kind| {
+        let cb = &cb;
+        let handle = handle.clone();
+        let kind = match kind {
+            JsDependencyKind::Config => "config",
+            JsDependencyKind::Format => "format",
+        };
+        let fut = async move { cb.call_async(kind.to_string()).await?.into_future().await };
+        let res = if tokio::runtime::Handle::try_current().is_ok() {
+            tokio::task::block_in_place(|| handle.block_on(fut))
+        } else {
+            handle.block_on(fut)
+        };
+        serde_json::from_value(res.ok().flatten()?).ok()
+    })
+}

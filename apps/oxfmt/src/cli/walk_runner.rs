@@ -1,5 +1,6 @@
 use std::{
     env,
+    ffi::OsStr,
     fmt::Write as _,
     io::BufWriter,
     path::PathBuf,
@@ -10,15 +11,18 @@ use std::{
 use oxc_diagnostics::{DiagnosticService, GraphicalTheme};
 
 use super::{
+    cache::{RunShape, Session},
     command::{FormatCommand, Mode, OutputMode},
     reporter::DefaultReporter,
     result::CliRunResult,
     service::{FormatService, SuccessResult},
-    walk::ScopedWalker,
+    walk::{ScopedWalker, resolve_format_plan},
+};
+use crate::core::{
+    ConfigScopes, FormatPlan, SourceFormatter, config_discovery, resolve_ignore_paths, utils,
 };
 #[cfg(feature = "napi")]
-use crate::core::JsConfigLoaderCb;
-use crate::core::{ConfigScopes, FormatPlan, SourceFormatter, resolve_ignore_paths, utils};
+use crate::core::{JsConfigLoaderCb, JsDependenciesCb};
 
 pub struct WalkRunner {
     options: FormatCommand,
@@ -27,6 +31,9 @@ pub struct WalkRunner {
     external_services: Option<crate::core::ExternalServices>,
     #[cfg(feature = "napi")]
     js_config_loader: Option<JsConfigLoaderCb>,
+    /// Asks Node what it read, for `--cache`.
+    #[cfg(feature = "napi")]
+    js_dependencies: Option<JsDependenciesCb>,
 }
 
 impl WalkRunner {
@@ -42,6 +49,8 @@ impl WalkRunner {
             external_services: None,
             #[cfg(feature = "napi")]
             js_config_loader: None,
+            #[cfg(feature = "napi")]
+            js_dependencies: None,
         }
     }
 
@@ -62,6 +71,14 @@ impl WalkRunner {
         self
     }
 
+    /// What Node read, for configs or in the format workers: for `--cache`.
+    #[cfg(feature = "napi")]
+    #[must_use]
+    pub fn with_js_dependencies(mut self, js_dependencies: JsDependenciesCb) -> Self {
+        self.js_dependencies = Some(js_dependencies);
+        self
+    }
+
     /// # Panics
     /// Panics if `napi` feature is enabled but external_services is not set.
     pub fn run(self) -> CliRunResult {
@@ -73,8 +90,14 @@ impl WalkRunner {
         let start_time = Instant::now();
 
         let cwd = self.cwd;
-        let FormatCommand { paths, mode, config_options, ignore_options, runtime_options } =
-            self.options;
+        let FormatCommand {
+            paths,
+            mode,
+            config_options,
+            ignore_options,
+            runtime_options,
+            cache_options,
+        } = self.options;
         // If `napi` feature is disabled, there is no other mode.
         #[cfg_attr(not(feature = "napi"), expect(irrefutable_let_patterns))]
         let Mode::Cli(format_mode) = mode else {
@@ -82,32 +105,76 @@ impl WalkRunner {
         };
         let num_of_threads = rayon::current_num_threads();
 
-        // Find and load root config file
-        let config_scopes = match ConfigScopes::load(
-            &cwd,
-            config_options.config.as_deref(),
-            config_options.use_nested_configs(),
-            #[cfg(feature = "napi")]
-            self.js_config_loader.as_ref(),
-        ) {
-            Ok(scopes) => scopes,
-            Err(err) => {
-                utils::print_and_flush(stderr, &format!("{err}\n"));
-                return CliRunResult::InvalidOptionConfig;
-            }
-        };
-
-        // NOTE: The caller (`run_cli()`) runs this whole function in `block_in_place()`
+        // With `--cache`: the last run of the same shape, and what of it still holds.
+        let vp_version = oxc_config::vp_version();
+        let mut cache = cache_options
+            .cache
+            .then(|| {
+                let shape = RunShape {
+                    cwd: &cwd,
+                    paths: &paths,
+                    config: config_options.config.as_deref(),
+                    use_nested_configs: config_options.use_nested_configs(),
+                    disable_nested_config: config_options.disable_nested_config,
+                    ignore_paths: &ignore_options.ignore_path,
+                    with_node_modules: ignore_options.with_node_modules,
+                    vp_version: vp_version.as_deref().map(OsStr::as_encoded_bytes),
+                };
+                Session::open(cache_options.cache_location.as_deref(), &shape)
+            })
+            .flatten();
         #[cfg(feature = "napi")]
-        if let Err(err) = self
-            .external_services
-            .as_ref()
-            .expect("External services must be set when `napi` feature is enabled")
-            .init(num_of_threads)
-        {
-            utils::print_and_flush(stderr, &format!("Failed to setup external services.\n{err}\n"));
-            return CliRunResult::InvalidOptionConfig;
+        if let (Some(cache), Some(js_dependencies)) = (&mut cache, self.js_dependencies) {
+            cache.set_js_dependencies(js_dependencies);
         }
+        #[cfg(feature = "napi")]
+        let js_config_loader = match &cache {
+            Some(cache) => self.js_config_loader.map(|loader| cache.js_config_loader(loader)),
+            None => self.js_config_loader,
+        };
+        // Nothing the walk or the configs read changed since the last run: no walk, and the
+        // configs are loaded only if a file needs formatting.
+        let replay = cache.as_ref().and_then(Session::replay);
+
+        // Find and load root config file, and set up the external services
+        let load_config_scopes = |stderr: &mut BufWriter<std::io::Stderr>| {
+            let config_scopes = match ConfigScopes::load(
+                &cwd,
+                config_options.config.as_deref(),
+                config_options.use_nested_configs(),
+                #[cfg(feature = "napi")]
+                js_config_loader.as_ref(),
+            ) {
+                Ok(scopes) => scopes,
+                Err(err) => {
+                    utils::print_and_flush(stderr, &format!("{err}\n"));
+                    return None;
+                }
+            };
+
+            // NOTE: The caller (`run_cli()`) runs this whole function in `block_in_place()`
+            #[cfg(feature = "napi")]
+            if let Err(err) = self
+                .external_services
+                .as_ref()
+                .expect("External services must be set when `napi` feature is enabled")
+                .init(num_of_threads)
+            {
+                utils::print_and_flush(
+                    stderr,
+                    &format!("Failed to setup external services.\n{err}\n"),
+                );
+                return None;
+            }
+            Some(config_scopes)
+        };
+        let config_scopes = match &replay {
+            Some(_) => None,
+            None => match load_config_scopes(stderr) {
+                Some(config_scopes) => Some(config_scopes),
+                None => return CliRunResult::InvalidOptionConfig,
+            },
+        };
 
         // Resolve ignore paths early to validate before walk starts
         let resolved_ignore_paths = match resolve_ignore_paths(&cwd, &ignore_options.ignore_path) {
@@ -137,45 +204,94 @@ impl WalkRunner {
         // Create `SourceFormatter` instance
         let source_formatter = SourceFormatter::new(num_of_threads);
         #[cfg(feature = "napi")]
-        let source_formatter = source_formatter.with_external_services(self.external_services);
+        let source_formatter =
+            source_formatter.with_external_services(self.external_services.clone());
 
         let cwd_for_format = cwd.clone();
         // Clone `tx_error` so both the walk threads and the format service can report errors
         let tx_error_for_format = tx_error.clone();
+        let files = cache.as_ref().map(Session::files);
 
         // Spawn formatting service on a dedicated thread so it doesn't occupy the rayon pool.
         // It just blocks on `rx_entry` waiting for entries; `par_bridge()` inside still uses rayon.
-        std::thread::spawn(move || {
-            let format_service = FormatService::new(cwd_for_format, format_mode, source_formatter);
+        let format_thread = std::thread::spawn(move || {
+            let format_service =
+                FormatService::new(cwd_for_format, format_mode, source_formatter).with_cache(files);
             format_service.run_streaming(rx_entry, &tx_error_for_format, &tx_success);
         });
 
-        // Run scoped walks (root + nested) sends entries to `tx_entry` and errors to `tx_error`.
-        // Manually drop after the walk to signal the formatting service that no more entries will be sent.
-        let walker = match ScopedWalker::new(cwd, &paths) {
-            Ok(walker) => walker,
-            Err(err) => {
-                drop(tx_entry);
-                drop(tx_error);
-                utils::print_and_flush(stderr, &format!("{err}\n"));
-                return CliRunResult::InvalidOptionConfig;
+        let mut unchanged_count: usize = 0;
+        let any_config_found = if let Some(replay) = replay {
+            // The last run's files: those whose stat says they're formatted are counted,
+            // the others resolved and formatted.
+            unchanged_count += replay.formatted;
+            if !replay.stale.is_empty() {
+                let Some(config_scopes) = load_config_scopes(stderr) else {
+                    return CliRunResult::InvalidOptionConfig;
+                };
+                for path in replay.stale {
+                    let resolver = match config_scopes.resolve(&path) {
+                        Ok(resolver) => resolver,
+                        Err(err) => {
+                            utils::print_and_flush(
+                                stderr,
+                                &format!("Failed to parse configuration.\n{err}\n"),
+                            );
+                            return CliRunResult::InvalidOptionConfig;
+                        }
+                    };
+                    if let Some(plan) = resolve_format_plan(&path, &resolver, &tx_error, &cwd, None)
+                    {
+                        let _ = tx_entry.send(plan);
+                    }
+                }
             }
-        };
-        let any_config_found = match walker.run(
-            &config_scopes,
-            &resolved_ignore_paths,
-            ignore_options.with_node_modules,
-            &tx_entry,
-            &tx_error,
-        ) {
-            Ok(()) => {
-                drop(tx_entry);
-                drop(tx_error);
-                config_scopes.any_config_found()
+            drop(tx_entry);
+            drop(tx_error);
+            if let Some(cache) = &mut cache {
+                cache.replayed();
             }
-            Err(err) => {
-                drop(tx_entry);
-                drop(tx_error);
+            replay.any_config_found
+        } else {
+            let config_scopes = config_scopes.expect("loaded unless the walk is replayed");
+            let recorder = cache.as_ref().map(|cache| {
+                cache.recorder(config_discovery().config_file_names(), config_scopes.use_nested())
+            });
+            if let Some(recorder) = &recorder {
+                // What the run reads outside the walk: an explicit config, and ignore files.
+                let config = config_options
+                    .config
+                    .as_deref()
+                    .map(|config| utils::normalize_relative_path(&cwd, config));
+                let default_ignore =
+                    ignore_options.ignore_path.is_empty().then(|| cwd.join(".prettierignore"));
+                for path in config.iter().chain(&default_ignore).chain(&resolved_ignore_paths) {
+                    recorder.file(path);
+                }
+            }
+
+            // Run scoped walks (root + nested) sends entries to `tx_entry` and errors to `tx_error`.
+            // Manually drop after the walk to signal the formatting service that no more entries will be sent.
+            let walker = match ScopedWalker::new(cwd.clone(), &paths) {
+                Ok(walker) => walker.with_recorder(recorder.clone()),
+                Err(err) => {
+                    drop(tx_entry);
+                    drop(tx_error);
+                    utils::print_and_flush(stderr, &format!("{err}\n"));
+                    return CliRunResult::InvalidOptionConfig;
+                }
+            };
+            let walked = walker.run(
+                &config_scopes,
+                &resolved_ignore_paths,
+                ignore_options.with_node_modules,
+                &tx_entry,
+                &tx_error,
+            );
+            drop(walker);
+            drop(tx_entry);
+            drop(tx_error);
+            if let Err(err) = walked {
                 let mut msg = format!("Failed to parse configuration.\n{err}\n");
                 // Nested configs are loaded lazily during the walk,
                 // so by the time a load failure surfaces some files in unaffected scopes may already have been written.
@@ -187,16 +303,25 @@ impl WalkRunner {
                 utils::print_and_flush(stderr, &msg);
                 return CliRunResult::InvalidOptionConfig;
             }
+            let any_config_found = config_scopes.any_config_found();
+            if let (Some(cache), Some(recorder)) = (&mut cache, recorder) {
+                cache.walked(recorder, any_config_found);
+            }
+            any_config_found
         };
 
         // Collect results and separate changed paths from unchanged count
         let mut changed_paths: Vec<(String, Option<Duration>)> = vec![];
-        let mut unchanged_count: usize = 0;
         for result in rx_success {
             match result {
                 SuccessResult::Changed(path, elapsed) => changed_paths.push((path, elapsed)),
                 SuccessResult::Unchanged => unchanged_count += 1,
             }
+        }
+        // Once the service is done with the file cache.
+        if let Some(cache) = cache {
+            let _ = format_thread.join();
+            cache.save();
         }
 
         // Print sorted changed file paths to stdout

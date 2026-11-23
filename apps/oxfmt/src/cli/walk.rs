@@ -14,6 +14,7 @@ use oxc_config::{
 };
 use oxc_diagnostics::{DiagnosticSender, DiagnosticService, OxcDiagnostic};
 
+use super::cache::WalkRecorder;
 use crate::core::{
     ConfigResolver, ConfigScopes, FormatPlan, ResolveOutcome, build_global_ignore_matchers,
     is_ignored,
@@ -48,6 +49,8 @@ pub struct ScopedWalker {
     paths: Vec<PathBuf>,
     glob_patterns: Vec<String>,
     exclude_patterns: Vec<String>,
+    /// With `--cache`: where the walk records what it reads.
+    recorder: Option<Arc<WalkRecorder>>,
 }
 
 impl ScopedWalker {
@@ -96,7 +99,32 @@ impl ScopedWalker {
             target_paths.push(full_path);
         }
 
-        Ok(Self { cwd, paths: target_paths, glob_patterns, exclude_patterns })
+        Ok(Self { cwd, paths: target_paths, glob_patterns, exclude_patterns, recorder: None })
+    }
+
+    /// Record what the walk reads (listings, ignore and config files, path arguments) into `recorder`.
+    #[must_use]
+    pub fn with_recorder(mut self, recorder: Option<Arc<WalkRecorder>>) -> Self {
+        self.recorder = recorder;
+        self
+    }
+
+    /// What the walk reads besides the directories it lists: each path argument's kind,
+    /// glob-like arguments that could be paths, and the directories above every target and
+    /// the cwd, where config and ignore files are looked up.
+    fn record_targets(&self, recorder: &WalkRecorder, targets: &FxHashSet<PathBuf>) {
+        for pattern in &self.glob_patterns {
+            recorder.target(&self.cwd.join(pattern));
+        }
+        let mut above: FxHashSet<&Path> = self.cwd.ancestors().collect();
+        for target in targets {
+            recorder.target(target);
+            let start = if target.is_dir() { Some(target.as_path()) } else { target.parent() };
+            above.extend(start.into_iter().flat_map(Path::ancestors));
+        }
+        for dir in above {
+            recorder.ancestor(dir);
+        }
     }
 
     /// Run the walk across all scopes.
@@ -131,6 +159,9 @@ impl ScopedWalker {
             // Exclude patterns alone should still walk, but unmatched globs should not.
             if initial_targets.is_empty() && self.glob_patterns.is_empty() {
                 initial_targets.insert(self.cwd.clone());
+            }
+            if let Some(recorder) = &self.recorder {
+                self.record_targets(recorder, &initial_targets);
             }
 
             let mut dirs = vec![];
@@ -182,8 +213,13 @@ impl ScopedWalker {
                     continue;
                 }
 
-                let Some(plan) = resolve_format_plan(file, &config_resolver, tx_error, &self.cwd)
-                else {
+                let Some(plan) = resolve_format_plan(
+                    file,
+                    &config_resolver,
+                    tx_error,
+                    &self.cwd,
+                    self.recorder.as_deref(),
+                ) else {
                     continue;
                 };
 
@@ -229,6 +265,7 @@ impl ScopedWalker {
                 tx_entry: tx_entry.clone(),
                 tx_error: tx_error.clone(),
                 fatal_error: Arc::clone(&fatal_error),
+                recorder: self.recorder.clone(),
             },
         );
 
@@ -317,6 +354,8 @@ struct WalkSinks {
     tx_entry: mpsc::Sender<FormatPlan>,
     tx_error: DiagnosticSender,
     fatal_error: Arc<OnceLock<String>>,
+    /// With `--cache`: records what the walk reads, for a later run to replay it.
+    recorder: Option<Arc<WalkRecorder>>,
 }
 
 /// Walk-wide config-resolution state shared across all visitors.
@@ -561,8 +600,13 @@ impl WalkVisitor {
         {
             return ignore::WalkState::Continue;
         }
-        let Some(plan) = resolve_format_plan(path, resolver, &self.sinks.tx_error, &self.cwd)
-        else {
+        let Some(plan) = resolve_format_plan(
+            path,
+            resolver,
+            &self.sinks.tx_error,
+            &self.cwd,
+            self.sinks.recorder.as_deref(),
+        ) else {
             return ignore::WalkState::Continue;
         };
 
@@ -584,9 +628,12 @@ impl ignore::ParallelVisitor for WalkVisitor {
             return ignore::WalkState::Continue;
         };
 
-        // Nothing to do at dir-level in `visit()`.
+        // Nothing to do at dir-level in `visit()`, but to record it with `--cache`.
         // Whether to walk into it is decided by `filter_entry()`.
         if file_type.is_dir() {
+            if let Some(recorder) = &self.sinks.recorder {
+                recorder.listed_dir(entry.path());
+            }
             return ignore::WalkState::Continue;
         }
         // Skip non-regular entries (symlinks of any kind, sockets, etc.) to
@@ -610,6 +657,9 @@ impl ignore::ParallelVisitor for WalkVisitor {
         // Here we (1) register the parent dir's scope when nested detection is on,
         // and (2) re-apply the global ignore for format eligibility.
         let is_config_file = self.config_state.scopes.nested_ctx().is_config_file(&path);
+        if is_config_file && let Some(recorder) = &self.sinks.recorder {
+            recorder.file(&path);
+        }
 
         if is_config_file
             && self.config_state.scopes.use_nested()
@@ -632,13 +682,14 @@ impl ignore::ParallelVisitor for WalkVisitor {
 /// Classify `path`, resolve its scope, and return the format plan if any.
 ///
 /// `None` means "not a formatting target" or "missing plugin"; resolve errors
-/// are reported via `tx_error` and also yield `None` so callers can move on
-/// to the next file.
-fn resolve_format_plan(
+/// are reported via `tx_error` (and to `recorder`, with `--cache`) and also yield `None`
+/// so callers can move on to the next file.
+pub fn resolve_format_plan(
     path: &Path,
     resolver: &ConfigResolver,
     tx_error: &DiagnosticSender,
     cwd: &Path,
+    recorder: Option<&WalkRecorder>,
 ) -> Option<FormatPlan> {
     let strategy = resolver.classify(path, None)?;
     match resolver.resolve(path, strategy) {
@@ -659,6 +710,9 @@ fn resolve_format_plan(
                 ],
             );
             let _ = tx_error.send(diagnostics);
+            if let Some(recorder) = recorder {
+                recorder.reported(path);
+            }
             None
         }
     }
@@ -722,7 +776,12 @@ mod tests_scope_resolution {
                 scopes,
                 walk_target_roots: Arc::from(vec![walk_root.to_path_buf()]),
             },
-            sinks: WalkSinks { tx_entry, tx_error, fatal_error: Arc::new(OnceLock::new()) },
+            sinks: WalkSinks {
+                tx_entry,
+                tx_error,
+                fatal_error: Arc::new(OnceLock::new()),
+                recorder: None,
+            },
             scope_cache: FxHashMap::default(),
         }
     }
