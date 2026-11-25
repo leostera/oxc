@@ -1,0 +1,41 @@
+# Temporary: runs the `--cache` tests on Linux, Windows and macOS on the fork. Not for upstream.
+name: oxfmt --cache tests
+
+permissions: {}
+
+on:
+  push:
+    branches: [ci/oxfmt-cache-slim]
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - if: runner.os == 'Windows'
+        run: git config --system core.longpaths true
+      - uses: taiki-e/checkout-action@7d1e50e93dc4fb3bba58f85018fadf77898aee8b # v1.4.2
+      - uses: oxc-project/setup-node@f46a72f95efdc55273fcd042d61c84e723b2892c # v1.4.1
+      - uses: oxc-project/setup-rust@12a52e3caf7bac9d8b9ca550a82c425ed6343aee # v1.0.18
+        with:
+          cache-key: oxfmt-cache-${{ matrix.os }}
+          components: clippy
+          save-cache: true
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+      - run: cargo test -p oxc_cache -p oxfmt --lib
+        shell: bash
+      # Only `oxc_cache`: on Windows, `oxc_language_server` (an `oxfmt` dependency) has lints of its own.
+      - run: cargo clippy -p oxc_cache --all-targets -- -D warnings
+        shell: bash
+      - name: oxfmt tests
+        run: |
+          pnpm --filter "./apps/oxfmt" build-test
+          pnpm --filter "./apps/oxfmt" test
+        shell: bash
+      - run: git diff --exit-code
+        shell: bash
